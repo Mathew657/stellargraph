@@ -17,7 +17,7 @@
 import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras import activations, initializers, constraints, regularizers
-from tensorflow.keras.layers import Input, Layer, Dropout, LSTM, Dense, Permute
+from tensorflow.keras.layers import Input, Layer, Dropout, LSTM, Dense, Permute, Reshape
 from ..mapper import SlidingFeaturesNodeGenerator
 from ..core.experimental import experimental
 from ..core.utils import calculate_laplacian
@@ -130,8 +130,10 @@ class FixedAdjacencyGraphConvolution(Layer):
             input_shapes (list of int): shapes of the layer's inputs (node features and adjacency matrix)
 
         """
-        _batch_dim, n_nodes, t_steps = input_shapes
-        self.units = t_steps
+        _batch_dim, n_nodes, t_steps, variates = input_shapes
+
+        # each variate is treated independently for this convolution
+        self.units = t_steps * variates
 
         self.A = self.add_weight(
             name="A",
@@ -140,7 +142,7 @@ class FixedAdjacencyGraphConvolution(Layer):
             initializer=initializers.constant(self.adj),
         )
         self.kernel = self.add_weight(
-            shape=(t_steps, self.units),
+            shape=(self.units, self.units),
             initializer=self.kernel_initializer,
             name="kernel",
             regularizer=self.kernel_regularizer,
@@ -165,20 +167,24 @@ class FixedAdjacencyGraphConvolution(Layer):
         Applies the layer.
 
         Args:
-            inputs (ndarray): node features (size B x N x T), where B is the batch size, T is the
-                sequence length, and N is the number of nodes in the graph.
+            inputs (ndarray): node features (size B x N x T x V), where B is the batch size, T is the
+                sequence length, N is the number of nodes in the graph, and V is the number of variates per node per sequence.
 
         Returns:
             Keras Tensor that represents the output of the layer.
         """
 
-        # Calculate the layer operation of GCN
+        shape = tf.shape(features)
+        # flatten all of the variates to be independent node features
+        # shape = B x N x (T V)
+        features = tf.reshape(features, [shape[0], shape[1], shape[2] * shape[3]])
 
-        # shape = B x T x N
+        # Calculate the layer operation of GCN
+        # shape = B x (T V) x N
         nodes_last = tf.transpose(features, [0, 2, 1])
         neighbours = K.dot(nodes_last, self.A)
 
-        # shape = B x N x T
+        # shape = B x N x (T V)
         h_graph = tf.transpose(neighbours, [0, 2, 1])
         output = K.dot(h_graph, self.kernel)
 
@@ -186,6 +192,9 @@ class FixedAdjacencyGraphConvolution(Layer):
         if self.bias is not None:
             output += self.bias
 
+        # restore the original multivariate shape
+        # shape = B x N x T x V
+        output = tf.reshape(features, shape)
         output = self.activation(output)
 
         return output
@@ -260,6 +269,9 @@ class GraphConvolutionLSTM:
 
             adj = generator.graph.to_adjacency_matrix(weighted=True).todense()
             seq_len = generator.window_size
+            variates = generator.variates
+        else:
+            variates = None
 
         super(GraphConvolutionLSTM, self).__init__()
 
@@ -269,11 +281,13 @@ class GraphConvolutionLSTM:
         self.lstm_layer_size = lstm_layer_size
         self.bias = bias
         self.dropout = dropout
-        self.outputs = adj.shape[0]
         self.adj = adj
         self.n_nodes = adj.shape[0]
         self.n_features = seq_len
         self.seq_len = seq_len
+        self.multivariate_input = variates is not None
+        self.variates = variates if self.multivariate_input else 1
+        self.outputs = self.n_nodes * self.variates
 
         self.kernel_initializer = initializers.get(kernel_initializer)
         self.kernel_regularizer = regularizers.get(kernel_regularizer)
@@ -312,7 +326,10 @@ class GraphConvolutionLSTM:
                 )
             )
 
-        self._layers.append(Permute((2, 1)))
+        # shape B x T x N x V
+        self._layers.append(Permute((2, 1, 3)))
+        # flatten the variates across all nodes, shape B x T x (N V)
+        self._layers.append(Reshape((self.seq_len, self.n_nodes * self.variates)))
 
         for ii in range(n_lstm_layers - 1):
             self._layers.append(
@@ -332,12 +349,19 @@ class GraphConvolutionLSTM:
         )
         self._layers.append(Dropout(self.dropout))
         self._layers.append(Dense(self.outputs, activation="sigmoid"))
+        if self.multivariate_input:
+            self._layers.append(Reshape((self.n_nodes, self.variates)))
 
     def __call__(self, x):
 
         x_in, out_indices = x
 
         h_layer = x_in
+        if not self.multivariate_input:
+            # normalize to always have a final variate dimension, with V = 1 if it doesn't exist
+            # shape = B x N x T x 1
+            h_layer = tf.expand_dims(h_layer, axis=-1)
+
         for layer in self._layers:
             h_layer = layer(h_layer)
         return h_layer
@@ -351,7 +375,12 @@ class GraphConvolutionLSTM:
             input tensors for the GCN model and `x_out` is a tensor of the GCN model output.
         """
         # Inputs for features
-        x_t = Input(batch_shape=(None, self.n_nodes, self.n_features))
+        if self.multivariate_input:
+            shape = (None, self.n_nodes, self.n_features, self.variates)
+        else:
+            shape = (None, self.n_nodes, self.n_features)
+
+        x_t = Input(batch_shape=shape)
 
         # Indices to gather for model output
         out_indices_t = Input(batch_shape=(None, self.n_nodes), dtype="int32")

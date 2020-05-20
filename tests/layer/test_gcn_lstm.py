@@ -16,6 +16,7 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 import tensorflow as tf
 
 from stellargraph import StellarGraph, IndexedArray
@@ -23,8 +24,13 @@ from stellargraph.mapper import SlidingFeaturesNodeGenerator
 from stellargraph.layer import GraphConvolutionLSTM
 
 
-def test_gcn_lstm_generator():
-    nodes = IndexedArray(np.arange(3 * 7).reshape(3, 7) / 21, index=["a", "b", "c"])
+@pytest.mark.parametrize("multivariate", [False, True])
+def test_gcn_lstm_generator(multivariate):
+    shape = (3, 7, 11) if multivariate else (3, 7)
+    total_elems = np.product(shape)
+    nodes = IndexedArray(
+        np.arange(total_elems).reshape(shape) / total_elems, index=["a", "b", "c"]
+    )
     edges = pd.DataFrame({"source": ["a", "b"], "target": ["b", "c"]})
     graph = StellarGraph(nodes, edges)
 
@@ -33,7 +39,7 @@ def test_gcn_lstm_generator():
 
     model = tf.keras.Model(*gcn_lstm.in_out_tensors())
 
-    model.compile("adam", loss="mse")
+    model.compile("adam", loss="mse", run_eagerly=True)
 
     history = model.fit(gen.flow(slice(0, 5), target_distance=1))
 
